@@ -83,7 +83,12 @@ function openRoomAsScreen(request, env) {
   if (request.headers.get('Upgrade') !== 'websocket') {
     return new Response('Expected a WebSocket upgrade', { status: 426 });
   }
-  const code = makeRoomCode();
+  // A refreshed/reconnecting screen may ask to RESUME its previous room
+  // (?code=ABCD) so already-joined phones stay bound to the same DO and the
+  // replay logic in attachScreen can rebuild its peers. Otherwise mint fresh.
+  const url = new URL(request.url);
+  const requested = (url.searchParams.get('code') || '').toUpperCase();
+  const code = /^[A-Z2-9]{4}$/.test(requested) ? requested : makeRoomCode();
   return forwardToRoom(request, env, code, 'screen');
 }
 
@@ -166,6 +171,14 @@ export class RoomDurableObject {
 
   /** Register the desktop screen socket and hand it its room code. */
   attachScreen(server, code) {
+    // Newest screen wins: if an older screen socket is still bound (page
+    // refresh, network flap, or a fresh-code collision), close it with a
+    // distinct code so ITS client knows it was replaced and must not fight
+    // back by auto-reconnecting into this same room.
+    for (const old of this.state.getWebSockets('screen')) {
+      try { old.close(4010, 'replaced'); } catch {}
+    }
+
     // Persist the room record (durable across hibernation / eviction).
     this.sql.exec(
       `INSERT INTO room (id, code, created_at) VALUES (1, ?, ?)
@@ -284,9 +297,15 @@ export class RoomDurableObject {
         try { s.send(JSON.stringify({ type: 'player-left', playerId: meta.slot })); } catch {}
       }
     } else if (meta.role === 'screen') {
-      // The host vanished — tell every controller so phones can show "screen offline".
-      for (const c of this.state.getWebSockets('controller')) {
-        try { c.send(JSON.stringify({ type: 'screen-disconnected' })); } catch {}
+      // The host vanished — tell every controller so phones can show "screen
+      // offline". Suppress it during a takeover: if a REPLACEMENT screen is
+      // already attached (compare identity — the dying socket may still be
+      // listed), the room is still hosted and phones shouldn't be told.
+      const others = this.state.getWebSockets('screen').filter((s) => s !== ws);
+      if (others.length === 0) {
+        for (const c of this.state.getWebSockets('controller')) {
+          try { c.send(JSON.stringify({ type: 'screen-disconnected' })); } catch {}
+        }
       }
     }
   }

@@ -57,7 +57,12 @@ let roomCode = '';
 
 function connectSignaling() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  signalSocket = new WebSocket(`${proto}://${location.host}/api/screen`);
+  // Resume our previous room when we have one (socket flap, or page refresh via
+  // sessionStorage) so already-joined phones stay valid — the DO replays their
+  // presence and we re-offer. Otherwise the server mints a fresh code.
+  const prev = roomCode || sessionStorage.getItem('oa-room') || '';
+  const resume = /^[A-Z2-9]{4}$/.test(prev) ? `?code=${prev}` : '';
+  signalSocket = new WebSocket(`${proto}://${location.host}/api/screen${resume}`);
 
   signalSocket.addEventListener('message', (ev) => {
     const msg = JSON.parse(ev.data);
@@ -81,7 +86,14 @@ function connectSignaling() {
     }
   });
 
-  signalSocket.addEventListener('close', () => {
+  signalSocket.addEventListener('close', (ev) => {
+    // 4010 = another screen took over this room code. Abandon it so we don't
+    // ping-pong takeovers with the other screen; the reconnect below will then
+    // mint a fresh room instead.
+    if (ev.code === 4010) {
+      roomCode = '';
+      sessionStorage.removeItem('oa-room');
+    }
     // The signaling channel is only needed for handshakes. If it drops after the
     // game is under way, live P2P data channels keep working. We retry so future
     // joins still function.
@@ -117,8 +129,16 @@ async function startPeer(playerId) {
   });
 
   pc.addEventListener('connectionstatechange', () => {
-    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+    const current = peers.get(playerId);
+    if (!current || current.pc !== pc) return; // superseded by a newer peer
+    // 'disconnected' is TRANSIENT (a Wi-Fi blip during handoff) and usually
+    // self-heals within seconds without the data channel ever closing — so it
+    // must NOT be treated as terminal. Grey the player out only on genuinely
+    // dead states, and restore the indicator when ICE recovers.
+    if (['failed', 'closed'].includes(pc.connectionState)) {
       markPlayerConnection(playerId, false);
+    } else if (pc.connectionState === 'connected') {
+      if (current.dc && current.dc.readyState === 'open') markPlayerConnection(playerId, true);
     }
   });
 
@@ -150,7 +170,9 @@ function wireDataChannel(playerId, dc) {
 /** Apply an inbound SDP answer or ICE candidate to the right peer connection. */
 async function handleSignal(playerId, data) {
   const peer = peers.get(playerId);
-  if (!peer) return;
+  // Shape-check the relayed payload — the DO forwards it opaquely, so a buggy
+  // or hostile phone could send null/junk that would otherwise throw here.
+  if (!peer || !data || typeof data !== 'object') return;
   const pc = peer.pc;
 
   if (data.sdp) {
@@ -277,11 +299,13 @@ function handleControllerInput(playerId, raw) {
   if (!turret) return;
 
   switch (msg.t) {
+    // Number.isFinite (not typeof) — NaN/Infinity sail through a typeof check
+    // AND through Math.min/Math.max clamping, then poison the physics.
     case 'aim':
-      if (typeof msg.a === 'number') turret.aim = msg.a;
+      if (Number.isFinite(msg.a)) turret.aim = msg.a;
       break;
     case 'power':
-      if (typeof msg.p === 'number') turret.power = Math.max(0, Math.min(1, msg.p));
+      if (Number.isFinite(msg.p)) turret.power = Math.max(0, Math.min(1, msg.p));
       break;
     case 'fire':
       fire(turret);
@@ -369,7 +393,14 @@ function stepWorld(dt) {
   for (const p of projectiles) {
     const outcome = classifyProjectile(p);
     if (outcome === 'alive') { survivors.push(p); continue; }
-    if (outcome.hitTurret) onTurretHit(outcome.hitTurret, p.owner);
+    if (outcome.hitTurret) {
+      // Score EXACTLY one hit per step. onTurretHit clears the field and moves
+      // the phase machine (possibly to gameover) — processing further
+      // collisions after it could erase a win or double-score, and assigning
+      // `projectiles = survivors` below would resurrect the cleared shots.
+      onTurretHit(outcome.hitTurret, p.owner);
+      return;
+    }
     // otherwise it hit a planet, flew off-world, or fizzled — just remove it.
   }
   projectiles = survivors;
@@ -399,6 +430,7 @@ function classifyProjectile(p) {
 }
 
 function onTurretHit(targetTurret, ownerId) {
+  if (phase !== 'playing') return; // never score outside live play (defense-in-depth)
   const shooter = turrets[ownerId - 1];
   if (!shooter) return;
   shooter.score += 1;
@@ -409,7 +441,7 @@ function onTurretHit(targetTurret, ownerId) {
     phase = 'gameover';
     showBanner(`PLAYER ${shooter.id} WINS`, shooter.color, 5, () => resetMatch());
   } else {
-    showBanner(`PLAYER ${shooter.id} SCORES`, shooter.color, 1.2, () => { if (phase === 'playing') {} });
+    showBanner(`PLAYER ${shooter.id} SCORES`, shooter.color, 1.2);
     // brief pause then continue
     phase = 'countdown';
     countdown = 1.2;
@@ -628,6 +660,9 @@ const bannerEl = document.getElementById('banner');
 const bannerMsgEl = document.getElementById('banner-msg');
 
 function onRoomReady(code) {
+  // Remember the room across a page refresh so we resume it (see connectSignaling)
+  // instead of stranding already-joined phones in an unhosted room.
+  try { sessionStorage.setItem('oa-room', code); } catch {}
   document.getElementById('room-code').textContent = code;
   document.getElementById('hud-code-val').textContent = code;
   document.getElementById('join-host').textContent = location.host;

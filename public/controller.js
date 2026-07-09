@@ -73,15 +73,26 @@ const fireBtn = document.getElementById('fire');
 })();
 
 // ==========================  SIGNALING  ==========================
+let connecting = false; // re-entrancy latch for connect()
+
 function connect(code) {
+  // Guard against stacking: a second CONNECT tap (or ?code auto-connect racing
+  // a manual tap) must not open a duplicate WebSocket + RTCPeerConnection on
+  // top of a live attempt — the duplicates would corrupt the handshake.
+  if (connecting) return;
+  connecting = true;
+  connectBtn.disabled = true;
+
   roomCode = code;
   gateMsg.textContent = '';
   gateMsg.innerHTML = '<div class="spinner"></div>';
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/api/join?code=${code}`);
+  const sock = new WebSocket(`${proto}://${location.host}/api/join?code=${code}`);
+  ws = sock;
 
-  ws.addEventListener('message', async (ev) => {
+  sock.addEventListener('message', async (ev) => {
+    if (ws !== sock) return; // superseded by a newer connection attempt
     const msg = JSON.parse(ev.data);
     switch (msg.type) {
       case 'joined':
@@ -92,20 +103,37 @@ function connect(code) {
         await handleSignal(msg.data);
         break;
       case 'error':
-        showGateError(msg.message || 'Could not join room.');
+        failGate(msg.message || 'Could not join room.');
         break;
       case 'screen-disconnected':
-        showGateError('The screen went offline. Ask the host to reopen the game.');
+        // Informational — STAY in the room. If the host refreshes the screen,
+        // the DO replays our presence and a fresh offer revives us in place.
+        showGateError('The screen went offline — waiting for it to come back…');
         setDisconnected();
         break;
     }
   });
 
-  ws.addEventListener('error', () => showGateError('Connection error. Check the code and try again.'));
-  ws.addEventListener('close', () => {
-    // If we never made it into a room, surface it on the gate.
-    if (!playerId) showGateError('Could not reach the room. Check the code.');
+  sock.addEventListener('error', () => {
+    if (ws === sock) failGate('Connection error. Check the code and try again.');
   });
+  sock.addEventListener('close', () => {
+    // Never made it into a room (and no specific error already shown) —
+    // surface a generic one. failGate() nulls `ws` first, so the specific
+    // server-sent error above can't be overwritten by this generic path.
+    if (ws === sock && !playerId) failGate('Could not reach the room. Check the code.');
+  });
+}
+
+/** Tear down a failed/duplicate attempt so the user can simply try again. */
+function failGate(text) {
+  const oldWs = ws, oldPc = pc;
+  ws = null; pc = null; channel = null; playerId = null; pendingIce = [];
+  connecting = false;
+  connectBtn.disabled = false;
+  try { oldWs && oldWs.close(); } catch {}
+  try { oldPc && oldPc.close(); } catch {}
+  showGateError(text);
 }
 
 function showGateError(text) {
@@ -130,30 +158,57 @@ function onJoined() {
  * `ondatachannel`. We create the PC eagerly so it exists before the offer lands.
  */
 function createPeer() {
-  pc = new RTCPeerConnection(RTC_CONFIG);
+  // Capture the instance: listeners must ignore events from a connection that
+  // has since been replaced (see the rebuild path in handleSignal), instead of
+  // reading whatever the module-level `pc` currently points at.
+  const myPc = new RTCPeerConnection(RTC_CONFIG);
+  pc = myPc;
 
   // Trickle our ICE candidates back to the Screen (DO infers the target = screen).
-  pc.addEventListener('icecandidate', (e) => {
-    if (e.candidate) wsSignal({ candidate: e.candidate });
+  myPc.addEventListener('icecandidate', (e) => {
+    if (pc === myPc && e.candidate) wsSignal({ candidate: e.candidate });
   });
 
   // The Screen's data channel arrives here.
-  pc.addEventListener('datachannel', (e) => {
+  myPc.addEventListener('datachannel', (e) => {
+    if (pc !== myPc) return;
     channel = e.channel;
     channel.addEventListener('open', onChannelOpen);
     channel.addEventListener('close', onChannelClose);
   });
 
-  pc.addEventListener('connectionstatechange', () => {
-    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) setDisconnected();
+  myPc.addEventListener('connectionstatechange', () => {
+    if (pc !== myPc) return; // superseded by a newer connection
+    // 'disconnected' is TRANSIENT — a Wi-Fi/cellular handoff drives ICE to
+    // 'disconnected' for a couple seconds and back, WITHOUT the data channel
+    // ever closing. Treating it as terminal would permanently brick the
+    // controls (nothing re-fires the channel's 'open' event afterwards). Only
+    // 'failed'/'closed' are dead; on recovery, restore the UI.
+    if (['failed', 'closed'].includes(myPc.connectionState)) {
+      setDisconnected();
+    } else if (myPc.connectionState === 'connected' && channel && channel.readyState === 'open') {
+      onChannelOpen();
+    }
   });
 }
 
 /** Handle an inbound SDP offer or ICE candidate from the Screen. */
 async function handleSignal(data) {
-  if (!pc) createPeer();
+  // Shape-check first — the DO relays this payload opaquely.
+  if (!data || typeof data !== 'object') return;
 
   if (data.sdp) {
+    // A fresh OFFER while we already hold a completed session means the Screen
+    // rebuilt its peer connection (page refresh / room takeover). The old
+    // session is dead — start over with a clean RTCPeerConnection rather than
+    // trying to apply a foreign SDP as a renegotiation.
+    if (pc && pc.remoteDescription) {
+      const oldPc = pc;
+      pc = null; channel = null; pendingIce = [];
+      try { oldPc.close(); } catch {}
+    }
+    if (!pc) createPeer();
+
     // The Screen's OFFER. Answer it.
     await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
     const answer = await pc.createAnswer();
@@ -164,6 +219,7 @@ async function handleSignal(data) {
       try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (err) { console.warn('ICE add failed', err); }
     }
   } else if (data.candidate) {
+    if (!pc) createPeer(); // candidate raced ahead of the offer — queue below
     if (pc.remoteDescription && pc.remoteDescription.type) {
       try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch (err) { console.warn('ICE add failed', err); }
     } else {
@@ -180,7 +236,9 @@ function wsSignal(data) {
 }
 
 // ==========================  CHANNEL LIFECYCLE  ==========================
-function onChannelOpen() {
+// Note: also invoked event-less from the ICE-recovery branch in createPeer().
+function onChannelOpen(e) {
+  if (e && channel && e.target !== channel) return; // stale channel of a replaced pc
   gate.classList.add('hidden');
   document.body.classList.remove('disconnected');
   fireBtn.disabled = false;
@@ -190,7 +248,12 @@ function onChannelOpen() {
   if (navigator.vibrate) navigator.vibrate(30);
 }
 
-function onChannelClose() { setDisconnected(); }
+function onChannelClose(e) {
+  // Only react if the CURRENT channel closed (or none replaced it yet) — the
+  // old channel of a rebuilt connection closing must not brick the new one.
+  if (channel && e && e.target !== channel) return;
+  setDisconnected();
+}
 
 function setDisconnected() {
   document.body.classList.add('disconnected');
