@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!-- Lock the mobile viewport: no pinch-zoom, no double-tap-zoom, fill the notch. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#03040a" />
+  <title>Orbital Artillery — Controller</title>
+  <style>
+    :root { color-scheme: dark; --p: #7cc4ff; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent;
+        -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+    html, body { margin: 0; height: 100%; overscroll-behavior: none; touch-action: none; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(900px 700px at 50% -10%, #16233f 0%, #070b18 60%, #03040a 100%);
+      color: #e8eefc; height: 100dvh; display: flex; flex-direction: column; overflow: hidden;
+    }
+
+    /* ---------- Gate: room-code entry / status ---------- */
+    #gate {
+      position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 22px; padding: 28px; text-align: center;
+      background: radial-gradient(900px 700px at 50% -10%, #16233f 0%, #070b18 60%, #03040a 100%);
+    }
+    #gate.hidden { display: none; }
+    #gate h1 { margin: 0; font-size: 1.6rem; letter-spacing: 0.05em;
+      background: linear-gradient(120deg, #7cc4ff, #b98cff); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    #gate p { margin: 0; opacity: 0.7; }
+    #code-input {
+      font-size: 2.2rem; letter-spacing: 0.5em; text-align: center; text-transform: uppercase;
+      width: 100%; max-width: 320px; padding: 16px; border-radius: 14px; border: 2px solid rgba(255,255,255,0.15);
+      background: rgba(255,255,255,0.05); color: #fff; outline: none;
+    }
+    #code-input:focus { border-color: var(--p); }
+    #connect-btn, .btn {
+      font-size: 1.1rem; font-weight: 700; letter-spacing: 0.05em; padding: 16px 34px; border: none;
+      border-radius: 14px; background: linear-gradient(120deg, #4b8dff, #8a63ff); color: #fff;
+    }
+    #gate-msg { min-height: 1.4em; font-size: 0.95rem; color: #ffb0b0; }
+    .spinner { width: 26px; height: 26px; border: 3px solid rgba(255,255,255,0.2);
+      border-top-color: var(--p); border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ---------- Controller surface ---------- */
+    header {
+      display: flex; align-items: center; justify-content: space-between; padding: 12px 16px;
+      padding-top: max(12px, env(safe-area-inset-top));
+    }
+    .who { display: flex; align-items: center; gap: 10px; font-weight: 800; letter-spacing: 0.05em; }
+    .who .badge { width: 14px; height: 14px; border-radius: 50%; background: var(--p); box-shadow: 0 0 12px var(--p); }
+    .room { opacity: 0.5; font-size: 0.85rem; letter-spacing: 0.2em; }
+
+    main { flex: 1; display: flex; flex-direction: column; gap: 14px; padding: 8px 18px 0; min-height: 0; }
+
+    /* Aim dial (rotary joystick): drag to point the barrel. */
+    .pad-wrap { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
+    #pad {
+      position: relative; width: min(70vw, 46vh); aspect-ratio: 1/1; border-radius: 50%;
+      background: radial-gradient(circle at 50% 45%, rgba(124,196,255,0.10), rgba(255,255,255,0.02));
+      border: 2px solid rgba(255,255,255,0.12); touch-action: none;
+    }
+    #pad .cross { position: absolute; inset: 0; }
+    #pad .cross::before, #pad .cross::after { content: ""; position: absolute; background: rgba(255,255,255,0.08); }
+    #pad .cross::before { left: 50%; top: 8%; bottom: 8%; width: 1px; transform: translateX(-0.5px); }
+    #pad .cross::after { top: 50%; left: 8%; right: 8%; height: 1px; transform: translateY(-0.5px); }
+    #knob {
+      position: absolute; width: 26%; height: 26%; border-radius: 50%; left: 50%; top: 50%;
+      transform: translate(-50%, -50%); background: var(--p); box-shadow: 0 0 24px var(--p);
+      transition: none;
+    }
+    #barrel-hint { position: absolute; left: 50%; top: 50%; width: 44%; height: 6px; border-radius: 3px;
+      background: linear-gradient(90deg, var(--p), transparent); transform-origin: 0 50%; opacity: 0.65; }
+    .pad-label { position: absolute; bottom: -26px; left: 0; right: 0; text-align: center; opacity: 0.45; font-size: 0.8rem; letter-spacing: 0.15em; }
+
+    /* Horizontal power slider. */
+    .power { display: flex; flex-direction: column; gap: 8px; }
+    .power .row { display: flex; justify-content: space-between; font-size: 0.85rem; letter-spacing: 0.1em; opacity: 0.7; }
+    #power-track {
+      position: relative; height: 44px; border-radius: 22px; background: rgba(255,255,255,0.06);
+      border: 2px solid rgba(255,255,255,0.12); touch-action: none; overflow: hidden;
+    }
+    #power-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 50%;
+      background: linear-gradient(90deg, #2e6bff, #8a63ff); }
+    #power-thumb { position: absolute; top: 50%; left: 50%; width: 30px; height: 30px; border-radius: 50%;
+      background: #fff; transform: translate(-50%, -50%); box-shadow: 0 2px 8px rgba(0,0,0,0.5); }
+
+    /* FIRE button. */
+    #fire {
+      margin: 6px 18px calc(18px + env(safe-area-inset-bottom));
+      height: 88px; border: none; border-radius: 20px; font-size: 1.8rem; font-weight: 900; letter-spacing: 0.15em;
+      color: #fff; background: radial-gradient(circle at 50% 30%, #ff8a5c, #e0392b);
+      box-shadow: 0 8px 24px rgba(224,57,43,0.45), inset 0 -4px 0 rgba(0,0,0,0.25);
+      touch-action: none; transition: transform 0.05s;
+    }
+    #fire:active { transform: scale(0.96); filter: brightness(1.15); }
+    #fire:disabled { filter: grayscale(0.6) brightness(0.6); box-shadow: none; }
+
+    .disconnected #fire, .disconnected #pad, .disconnected #power-track { opacity: 0.4; pointer-events: none; }
+  </style>
+</head>
+<body class="disconnected">
+  <!-- Entry gate: enter code + connection status -->
+  <div id="gate">
+    <h1>ORBITAL ARTILLERY</h1>
+    <p>Enter the 4-character code shown on the screen.</p>
+    <input id="code-input" maxlength="4" autocomplete="off" autocapitalize="characters"
+           autocorrect="off" spellcheck="false" inputmode="text" placeholder="CODE" />
+    <button id="connect-btn" class="btn">CONNECT</button>
+    <div id="gate-msg"></div>
+  </div>
+
+  <!-- Controller surface -->
+  <header>
+    <div class="who"><span class="badge" id="badge"></span><span id="who-label">CONNECTING…</span></div>
+    <div class="room" id="room-label"></div>
+  </header>
+
+  <main>
+    <div class="pad-wrap">
+      <div id="pad">
+        <div class="cross"></div>
+        <div id="barrel-hint"></div>
+        <div id="knob"></div>
+        <div class="pad-label">AIM</div>
+      </div>
+    </div>
+
+    <div class="power">
+      <div class="row"><span>POWER</span><span id="power-pct">50%</span></div>
+      <div id="power-track">
+        <div id="power-fill"></div>
+        <div id="power-thumb"></div>
+      </div>
+    </div>
+  </main>
+
+  <button id="fire" disabled>FIRE</button>
+
+  <script src="/controller.js"></script>
+</body>
+</html>

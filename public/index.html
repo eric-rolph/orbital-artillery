@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Orbital Artillery</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(1200px 800px at 50% -10%, #1b2a4a 0%, #070b18 60%, #03040a 100%);
+      color: #e8eefc;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      min-height: 100%; text-align: center; padding: 24px; gap: 28px;
+    }
+    h1 { font-size: clamp(2rem, 6vw, 4rem); margin: 0; letter-spacing: 0.04em;
+         background: linear-gradient(120deg, #7cc4ff, #b98cff); -webkit-background-clip: text;
+         background-clip: text; color: transparent; }
+    p.sub { margin: 0; opacity: 0.75; max-width: 46ch; line-height: 1.5; }
+    .cards { display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; }
+    a.card {
+      display: block; text-decoration: none; color: inherit;
+      background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 18px; padding: 28px 32px; min-width: 240px; transition: transform .15s, border-color .15s;
+    }
+    a.card:hover { transform: translateY(-4px); border-color: #7cc4ff; }
+    a.card .emoji { font-size: 3rem; }
+    a.card h2 { margin: 12px 0 6px; font-size: 1.4rem; }
+    a.card span { opacity: 0.7; font-size: 0.95rem; }
+    footer { opacity: 0.4; font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <h1>ORBITAL ARTILLERY</h1>
+  <p class="sub">A couch-multiplayer artillery duel. Curve your shots through the gravity of two worlds. One big screen, two phones as gamepads.</p>
+  <div class="cards">
+    <a class="card" href="/screen.html">
+      <div class="emoji">🖥️</div>
+      <h2>Open the Screen</h2>
+      <span>Run this on the TV or monitor everyone can see.</span>
+    </a>
+    <a class="card" href="/controller.html">
+      <div class="emoji">📱</div>
+      <h2>Be a Controller</h2>
+      <span>Grab your phone and enter the room code.</span>
+    </a>
+  </div>
+  <footer>WebRTC peer-to-peer · Cloudflare Workers + Durable Objects</footer>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "orbital-artillery",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-multiplayer 2D artillery game — desktop Screen + phone Controllers over WebRTC, signaled by a Cloudflare Worker Durable Object.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

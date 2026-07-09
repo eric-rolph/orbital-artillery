@@ -1,0 +1,30 @@
+name: Deploy to Cloudflare
+
+# Every push to main ships to Cloudflare Workers (script + Durable Object + static
+# assets) via Wrangler. Credentials live in repo secrets, never in the tree:
+#   CLOUDFLARE_API_TOKEN  – scoped API token (Workers Scripts: Edit)
+#   CLOUDFLARE_ACCOUNT_ID – target account id
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency: deploy-${{ github.ref }} # never run two deploys of the same ref at once
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Deploy with Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

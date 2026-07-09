@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Orbital Artillery — Screen</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #03040a; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #e8eefc; }
+
+    /* The gameplay canvas fills the viewport. */
+    #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+    /* ---- Lobby overlay: shown until both players' data channels are live ---- */
+    #lobby {
+      position: fixed; inset: 0; z-index: 10;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 28px; text-align: center; padding: 24px;
+      background: radial-gradient(1200px 800px at 50% -10%, #1b2a4a 0%, #070b18 60%, #03040a 100%);
+    }
+    #lobby.hidden { display: none; }
+    #lobby h1 { font-size: clamp(1.6rem, 4vw, 3rem); margin: 0; letter-spacing: 0.04em;
+      background: linear-gradient(120deg, #7cc4ff, #b98cff); -webkit-background-clip: text;
+      background-clip: text; color: transparent; }
+    .join-row { display: flex; gap: 40px; align-items: center; flex-wrap: wrap; justify-content: center; }
+    .code-box { display: flex; flex-direction: column; gap: 10px; align-items: center; }
+    .code-label { text-transform: uppercase; letter-spacing: 0.3em; font-size: 0.85rem; opacity: 0.6; }
+    #room-code {
+      font-size: clamp(3rem, 12vw, 8rem); font-weight: 800; letter-spacing: 0.15em;
+      font-variant-numeric: tabular-nums; line-height: 1;
+      background: linear-gradient(120deg, #9ad0ff, #d7b3ff); -webkit-background-clip: text;
+      background-clip: text; color: transparent; text-shadow: 0 0 40px rgba(124,196,255,0.25);
+    }
+    #join-url { opacity: 0.75; font-size: 1.05rem; }
+    #join-url b { color: #7cc4ff; }
+    #qr { background: #fff; padding: 12px; border-radius: 14px; width: 200px; height: 200px;
+      display: flex; align-items: center; justify-content: center; }
+    #qr canvas, #qr img { width: 100%; height: 100%; }
+    #qr.empty { display: none; }
+
+    .players { display: flex; gap: 28px; }
+    .pslot { display: flex; flex-direction: column; align-items: center; gap: 10px;
+      padding: 18px 26px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.03); min-width: 150px; transition: border-color .2s, background .2s; }
+    .pslot .dot { width: 16px; height: 16px; border-radius: 50%; background: #33405e; transition: background .2s, box-shadow .2s; }
+    .pslot .name { font-weight: 700; letter-spacing: 0.05em; }
+    .pslot .status { font-size: 0.85rem; opacity: 0.6; }
+    .pslot[data-state="joined"] { background: rgba(124,196,255,0.06); }
+    .pslot[data-state="ready"] .dot { box-shadow: 0 0 16px currentColor; }
+    .pslot.p1 { --c: #ff6b6b; } .pslot.p2 { --c: #4dd0ff; }
+    .pslot[data-state="joined"] .dot, .pslot[data-state="ready"] .dot { background: var(--c); color: var(--c); }
+
+    #hint { opacity: 0.5; font-size: 0.9rem; max-width: 50ch; line-height: 1.5; }
+
+    /* ---- In-game HUD ---- */
+    #hud { position: fixed; top: 0; left: 0; right: 0; z-index: 5; display: none;
+      justify-content: space-between; padding: 16px 22px; pointer-events: none; }
+    #hud.show { display: flex; }
+    .hud-side { display: flex; flex-direction: column; gap: 4px; }
+    .hud-side.right { align-items: flex-end; text-align: right; }
+    .hud-name { font-weight: 800; letter-spacing: 0.08em; font-size: 1.1rem; }
+    .hud-score { font-size: 2.4rem; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+    .hud-conn { font-size: 0.8rem; opacity: 0.7; }
+    .p1c { color: #ff6b6b; } .p2c { color: #4dd0ff; }
+    #hud-code { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+      z-index: 5; opacity: 0.4; font-size: 0.9rem; letter-spacing: 0.2em; display: none; }
+    #hud-code.show { display: block; }
+
+    /* ---- Banner (round / winner announcements) ---- */
+    #banner { position: fixed; inset: 0; z-index: 8; display: none;
+      align-items: center; justify-content: center; pointer-events: none; }
+    #banner.show { display: flex; }
+    #banner .msg { font-size: clamp(2rem, 8vw, 6rem); font-weight: 800; text-align: center;
+      text-shadow: 0 0 60px rgba(0,0,0,0.6); animation: pop .4s ease-out; }
+    @keyframes pop { from { transform: scale(0.7); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <!-- Lobby: room code, QR, join URL, and the two player slots filling up -->
+  <div id="lobby">
+    <h1>ORBITAL ARTILLERY</h1>
+    <div class="join-row">
+      <div class="code-box">
+        <div class="code-label">Room Code</div>
+        <div id="room-code">····</div>
+        <div id="join-url">Go to <b id="join-host">…</b> on your phone</div>
+      </div>
+      <div id="qr" class="empty"></div>
+    </div>
+    <div class="players">
+      <div class="pslot p1" id="slot-1" data-state="empty">
+        <div class="dot"></div><div class="name">PLAYER 1</div><div class="status">waiting…</div>
+      </div>
+      <div class="pslot p2" id="slot-2" data-state="empty">
+        <div class="dot"></div><div class="name">PLAYER 2</div><div class="status">waiting…</div>
+      </div>
+    </div>
+    <div id="hint">Open this page on the shared screen. Each player joins from their phone by visiting the address above and entering the room code. First to 3 hits wins.</div>
+  </div>
+
+  <!-- In-game scoreboard -->
+  <div id="hud">
+    <div class="hud-side left">
+      <div class="hud-name p1c">PLAYER 1</div>
+      <div class="hud-score p1c" id="score-1">0</div>
+      <div class="hud-conn" id="conn-1">●</div>
+    </div>
+    <div class="hud-side right">
+      <div class="hud-name p2c">PLAYER 2</div>
+      <div class="hud-score p2c" id="score-2">0</div>
+      <div class="hud-conn" id="conn-2">●</div>
+    </div>
+  </div>
+  <div id="hud-code">ROOM <span id="hud-code-val"></span></div>
+
+  <div id="banner"><div class="msg" id="banner-msg"></div></div>
+
+  <!-- QR encoder, self-hosted so it works on an offline LAN and can't 404 out
+       from under us. If it somehow fails to load, screen.js degrades gracefully
+       to showing just the URL + code. (node-qrcode, MIT.) -->
+  <script src="/vendor/qrcode.min.js"></script>
+  <script src="/screen.js"></script>
+</body>
+</html>

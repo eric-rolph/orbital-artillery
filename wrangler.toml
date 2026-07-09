@@ -1,0 +1,23 @@
+name = "orbital-artillery"
+main = "worker.js"
+compatibility_date = "2025-04-01"
+
+# Static Assets: the screen/controller HTML+JS are served straight from the edge.
+# They are matched BEFORE the Worker runs, so the Worker only handles the two
+# dynamic WebSocket routes (/screen, /join). Non-file paths fall through to it.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# One Durable Object class = one game room, keyed by its 4-letter code.
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "RoomDurableObject"
+
+# SQLite storage backend for the DO (required for state.storage.sql).
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RoomDurableObject"]
+
+[observability]
+enabled = true
