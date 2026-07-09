@@ -1,9 +1,17 @@
-# 🛰️ Orbital Artillery
+# 🛰️ Orbital Artillery — Kepler's Duel
 
 A **local-multiplayer, browser-based 2D artillery game**. One shared display (a TV
-or monitor) is the **Screen**; each player's **smartphone** is the gamepad. Curve
-your shots through the gravity of two planets and blast the other player's turret.
-First to **3 hits** wins.
+or monitor) is the **Screen**; each player's **smartphone** is the gamepad.
+
+The battlefield is a **living clockwork solar system**: two craggy, slowly-spinning
+planets ride elliptical orbits around a molten sun, carrying the players' turrets
+with them. Orbital periods are deliberately mismatched (~70s vs ~112s), so the
+duel cycles between *conjunction* (clean firing lanes) and *opposition* (the sun
+in the way — slingshot territory). The sun vaporizes careless shots, but **dive
+inside its graze ring and out again and your shot goes white-hot: a hit scores
+double**. A time-true trajectory preview integrates against the system *as it
+will be*, with ghost outlines showing each planet 1.5s ahead. First to **3 points**
+wins.
 
 Built to demonstrate a **WebRTC multi-peer architecture** with a **Cloudflare
 Worker + SQLite Durable Object** doing nothing but the handshake — after that,
@@ -75,9 +83,22 @@ Manual deploy: `npm run deploy`.
 
 - **Determinism**: physics runs on a fixed `1/120s` timestep in a logical
   `1600×900` world, letterboxed to any monitor, so behavior is resolution-independent.
+- **On-rails solar system**: planets follow closed-form ellipses
+  (`x = Rx·cos(ωt+φ)`) and spin at constant rates — every body position is an
+  analytic function of `simTime`. No N-body integration, no drift, and the
+  trajectory preview can evaluate the system at future times *exactly*.
+- **Lumpy terrain**: each planet's surface is a radial heightfield `r(θ)`
+  (seeded harmonics in a 128-entry LUT). Collision = one broad-phase circle
+  test, one `atan2`, one array lookup. The silhouette is a cached `Path2D`
+  drawn inside a rotated frame, so spin is free at render time.
 - **Gravity**: each projectile is integrated under the summed inverse-square pull
-  of both planets (with a softening term). A live trajectory preview ghosts the
-  same integrator.
+  of the sun and both (moving) planets, with a softening term. Shots inherit
+  their launch planet's orbital velocity — as does the preview.
+- **Sun-graze bounty**: cross into the dashed ring (`1.35·R☉`) and back out alive
+  and the shot is worth 2 points on a hit; preview dots turn gold from the step
+  a shot would qualify. Entry-gated (a shot must cross *into* the ring in
+  flight), and the ring is sized so no planet surface can ever dip inside it —
+  both asserted at boot.
 - **Reliability**: the input data channel is ordered+reliable — on a LAN,
   retransmits are negligible and a dropped FIRE would be unacceptable.
 - **No TURN**: only STUN is configured. Relaying would drag a server back into the

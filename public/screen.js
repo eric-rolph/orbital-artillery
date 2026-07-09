@@ -253,29 +253,168 @@ const WIN_SCORE = 3;
 const DT = 1 / 120;          // fixed physics timestep
 const MAX_STEPS = 8;         // clamp catch-up to avoid a spiral of death
 
-// Two celestial bodies with independent gravity wells.
+// ---------------------------------------------------------------------------
+// THE SOLAR SYSTEM ("Kepler's Duel")
+//
+// The battlefield is a clockwork heliocentric system, entirely ON RAILS:
+// planets ride closed-form ellipses (x = Rx·cos(ωt+φ), y = Ry·sin(ωt+φ)) and
+// spin at constant rates, so every position is an analytic function of simTime.
+// That buys three things at once:
+//   • determinism — no integration error can accumulate in the world itself;
+//   • cheap physics — body positions cost two trig calls, no N-body solve;
+//   • a truthful preview — the aiming ghost can evaluate the system at
+//     (simTime + k·dt) analytically and show where the world WILL be.
+//
+// MISMATCHED periods (~70s inner vs ~112s outer) make the duel geometry cycle
+// through conjunction (clean firing lanes) and opposition (sun in the way —
+// slingshot territory) roughly once per round.
+// ---------------------------------------------------------------------------
+
+/** Clock the whole system runs on. Advances by DT per physics step. */
+let simTime = 0;
+
+// Deterministic PRNG for terrain. The screen is the single authority (phones
+// are dumb gamepads), so a per-boot random seed is safe — sim, collision and
+// preview all read the same LUTs. A new world every match keeps it fresh.
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let z = s;
+    z = Math.imul(z ^ (z >>> 15), z | 1);
+    z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
+    return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const WORLD_SEED = (Math.random() * 0xffffffff) >>> 0;
+
+// The sun: fixed at world center, dominant gravity well, kills any projectile
+// that touches it. gm is assigned after the planets exist (2.5× the heaviest).
+const sun = { x: WORLD_W / 2, y: WORLD_H / 2, r: 66, gm: 0 };
+// Passing INSIDE this ring and coming back out alive is a "sun graze" — the
+// shot goes white-hot and scores DOUBLE on a hit. (A ring-shaped skill check:
+// thread between glory at r≈89 and vaporization at r=72.)
+// 1.35 — NOT larger: the inner planet's perihelion surface approaches within
+// ~95 of the sun, and the ring must sit safely inside that so a turret can
+// never stand inside the bounty zone and mint free double points (the boot
+// sweep below asserts this). The bounty is also ENTRY-GATED in the sim: a
+// shot must cross INTO the ring in flight before its exit can count.
+const GRAZE_R = sun.r * 1.35;
+
+// --- Lumpy terrain: a radial heightfield r(θ) sampled into a LUT. -----------
+// Collision against an irregular planet is then: one broad-phase circle test
+// (maxR), one atan2, one array lookup — barely dearer than a circle test.
+const LUT_N = 128;
+
+function makeTerrain(rng, baseR, roughness) {
+  // Sum a few low-order harmonics for continents/ridges. Roughness is kept
+  // modest (±~10% of baseR) so orbit clearances stay provable below.
+  const harmonics = [];
+  for (let h = 0; h < 4; h++) {
+    harmonics.push({
+      k: 2 + h + Math.floor(rng() * 3),            // angular frequency
+      amp: (roughness * baseR) * (0.4 + rng() * 0.6) / (h + 1),
+      ph: rng() * Math.PI * 2,
+    });
+  }
+  const lut = new Float32Array(LUT_N);
+  let maxR = 0;
+  for (let i = 0; i < LUT_N; i++) {
+    const th = (i / LUT_N) * Math.PI * 2;
+    let r = baseR;
+    for (const hm of harmonics) r += hm.amp * Math.sin(hm.k * th + hm.ph);
+    lut[i] = r;
+    if (r > maxR) maxR = r;
+  }
+  return { lut, maxR };
+}
+
+/** Surface radius at a LOCAL (unrotated) angle. */
+function lutRadius(pl, localAngle) {
+  let idx = Math.round((localAngle / (Math.PI * 2)) * LUT_N) % LUT_N;
+  if (idx < 0) idx += LUT_N;
+  return pl.lut[idx];
+}
+
+function makePlanet(cfg) {
+  const rng = mulberry32(WORLD_SEED ^ Math.imul(cfg.id + 1, 0x9e3779b9));
+  const { lut, maxR } = makeTerrain(rng, cfg.baseR, 0.10);
+
+  // Cache the silhouette as a Path2D in LOCAL coordinates; rendering just
+  // translates + rotates it, so planet spin is free at draw time.
+  const path = new Path2D();
+  for (let i = 0; i < LUT_N; i++) {
+    const th = (i / LUT_N) * Math.PI * 2;
+    const px = Math.cos(th) * lut[i], py = Math.sin(th) * lut[i];
+    if (i === 0) path.moveTo(px, py); else path.lineTo(px, py);
+  }
+  path.closePath();
+
+  // Dark surface blotches (drawn inside the rotating frame) — they're what
+  // makes the spin VISIBLE, alongside the lumpy silhouette.
+  const blotches = [];
+  for (let i = 0; i < 5; i++) {
+    const a = rng() * Math.PI * 2, d = rng() * cfg.baseR * 0.65;
+    blotches.push({ x: Math.cos(a) * d, y: Math.sin(a) * d, r: cfg.baseR * (0.12 + rng() * 0.2) });
+  }
+
+  return {
+    ...cfg,
+    w: (Math.PI * 2) / cfg.period,   // orbital angular rate
+    gm: GRAV * cfg.baseR * cfg.baseR,
+    lut, maxR, path, blotches,
+    x: 0, y: 0, rot: 0,              // filled by updateBodies() every step
+  };
+}
+
+// Inner world orbits fast (~70s), outer slow (~112s); they counter-rotate.
+// Ellipses are x-stretched to exploit the 16:9 world. Radii/sizes are chosen
+// so the two planets can NEVER touch (verified by the boot-time sweep below)
+// and the inner one always clears the sun's corona.
 const planets = [
-  { x: 470, y: 520, r: 92, color: '#6b8cff', glow: '#3a56c9' },
-  { x: 1150, y: 380, r: 116, color: '#ff9d5c', glow: '#c9622a' },
+  makePlanet({ id: 0, baseR: 66, Rx: 280, Ry: 175, period: 70,  phi: 0,       spin: +(Math.PI * 2) / 85, color: '#6b8cff', glow: '#3a56c9' }),
+  makePlanet({ id: 1, baseR: 72, Rx: 470, Ry: 345, period: 112, phi: Math.PI, spin: -(Math.PI * 2) / 95, color: '#ff9d5c', glow: '#c9622a' }),
 ];
-// Precompute GM (= G · mass, with mass ∝ r²) for each planet.
-for (const p of planets) p.gm = GRAV * p.r * p.r;
+sun.gm = 2.5 * Math.max(...planets.map((p) => p.gm));
+
+/** Closed-form planet center at time t. */
+function planetPosAt(pl, t) {
+  const a = pl.w * t + pl.phi;
+  return { x: sun.x + pl.Rx * Math.cos(a), y: sun.y + pl.Ry * Math.sin(a) };
+}
+
+/** Closed-form planet velocity at time t (derivative of the ellipse). */
+function planetVelAt(pl, t) {
+  const a = pl.w * t + pl.phi;
+  return { vx: -pl.Rx * pl.w * Math.sin(a), vy: pl.Ry * pl.w * Math.cos(a) };
+}
+
+/** Does point (x,y) at time t penetrate planet pl's terrain (padded by pad)? */
+function hitsPlanet(pl, x, y, t, pad) {
+  const c = planetPosAt(pl, t);
+  const dx = x - c.x, dy = y - c.y;
+  const d2 = dx * dx + dy * dy;
+  const broad = pl.maxR + pad;
+  if (d2 > broad * broad) return false;                       // broad phase
+  const r = lutRadius(pl, Math.atan2(dy, dx) - pl.spin * t) + pad; // narrow: LUT
+  return d2 <= r * r;
+}
 
 // Two turrets, one per player, anchored on the surface of "their" planet.
-// anchor is the angle (from the planet center) at which the turret sits.
+// anchor is the LOCAL angle on the planet — rotation carries the turret
+// around the world, which is half the gameplay of this design.
 const turrets = [
-  makeTurret(1, planets[0], -Math.PI * 0.62, -0.15, '#ff6b6b'), // Player 1 on the blue planet
-  makeTurret(2, planets[1], -Math.PI * 0.38, Math.PI + 0.15, '#4dd0ff'), // Player 2 on the orange planet
+  makeTurret(1, planets[0], -Math.PI * 0.62, -0.15, '#ff6b6b'), // Player 1, inner world
+  makeTurret(2, planets[1], -Math.PI * 0.38, Math.PI + 0.15, '#4dd0ff'), // Player 2, outer world
 ];
 
 function makeTurret(id, planet, anchorAngle, defaultAim, color) {
-  const bx = planet.x + Math.cos(anchorAngle) * planet.r;
-  const by = planet.y + Math.sin(anchorAngle) * planet.r;
   return {
     id, planet, color,
-    x: bx, y: by,          // base position on the planet surface
-    anchorAngle,
-    aim: defaultAim,       // barrel angle (world radians)
+    x: 0, y: 0,            // world position — recomputed each step (planet moves & spins)
+    anchorAngle,           // local surface angle
+    anchorR: lutRadius(planet, anchorAngle), // surface radius at that angle
+    aim: defaultAim,       // barrel angle (world radians — the phone dial is world-space)
     power: 0.5,            // 0..1
     score: 0,
     cooldown: 0,
@@ -284,7 +423,49 @@ function makeTurret(id, planet, anchorAngle, defaultAim, color) {
   };
 }
 
-/** @type {{x:number,y:number,vx:number,vy:number,owner:number,life:number,trail:{x:number,y:number}[]}[]} */
+/** Recompute every on-rails body + everything riding one, for `simTime`. */
+function updateBodies() {
+  for (const pl of planets) {
+    const c = planetPosAt(pl, simTime);
+    pl.x = c.x; pl.y = c.y;
+    pl.rot = pl.spin * simTime;
+  }
+  for (const t of turrets) {
+    const a = t.anchorAngle + t.planet.rot;
+    t.x = t.planet.x + Math.cos(a) * t.anchorR;
+    t.y = t.planet.y + Math.sin(a) * t.anchorR;
+  }
+}
+
+// Boot-time safety sweep: prove the two planets can never overlap at ANY pair
+// of orbital angles (a superset of what mismatched periods can produce).
+(function verifyOrbitClearance() {
+  const need = planets[0].maxR + planets[1].maxR + 4;
+  let worst = Infinity;
+  for (let i = 0; i < 128; i++) {
+    const a1 = (i / 128) * Math.PI * 2;
+    const p1x = sun.x + planets[0].Rx * Math.cos(a1), p1y = sun.y + planets[0].Ry * Math.sin(a1);
+    for (let j = 0; j < 128; j++) {
+      const a2 = (j / 128) * Math.PI * 2;
+      const dx = p1x - (sun.x + planets[1].Rx * Math.cos(a2));
+      const dy = p1y - (sun.y + planets[1].Ry * Math.sin(a2));
+      const d = Math.hypot(dx, dy);
+      if (d < worst) worst = d;
+    }
+  }
+  if (worst < need) console.warn(`Orbit clearance violated: min ${worst.toFixed(1)} < needed ${need.toFixed(1)}`);
+  // The graze bounty's anti-exploit invariant: no planet surface (hence no
+  // turret) may ever dip inside the graze ring.
+  for (const p of planets) {
+    const closest = Math.min(p.Rx, p.Ry) - p.maxR;
+    if (closest <= GRAZE_R + 4) console.warn(`Graze-ring clearance violated: planet ${p.id} approaches ${closest.toFixed(1)} <= ${(GRAZE_R + 4).toFixed(1)}`);
+  }
+})();
+
+/** Render-only effects (vaporization flashes etc.) — never touch the sim. */
+let fx = [];
+
+/** @type {{x:number,y:number,vx:number,vy:number,owner:number,life:number,muzzle:number,inGraze:boolean,boosted:boolean,trail:{x:number,y:number}[]}[]} */
 let projectiles = [];
 
 // High-level state machine for the screen.
@@ -293,14 +474,23 @@ let countdown = 0;
 let bannerTimer = 0;
 
 // ---- Gravity field shared by the live sim AND the aim-preview ghost. -------
-function gravityAt(x, y) {
-  let ax = 0, ay = 0;
+// Pass a future t and the field is evaluated where the planets WILL be —
+// that's what keeps the trajectory preview truthful on a moving battlefield.
+function gravityAt(x, y, t = simTime) {
+  // Sun (fixed).
+  let dx = sun.x - x, dy = sun.y - y;
+  let r2 = dx * dx + dy * dy + SOFTENING * SOFTENING;
+  let invR = 1 / Math.sqrt(r2);
+  let a = sun.gm / r2;
+  let ax = a * dx * invR, ay = a * dy * invR;
+  // Planets (on rails at time t).
   for (const p of planets) {
-    const dx = p.x - x, dy = p.y - y;
-    const r2 = dx * dx + dy * dy + SOFTENING * SOFTENING;
-    const invR = 1 / Math.sqrt(r2);
-    const a = p.gm / r2; // magnitude = GM / r²
-    ax += a * dx * invR; // times unit direction
+    const c = planetPosAt(p, t);
+    dx = c.x - x; dy = c.y - y;
+    r2 = dx * dx + dy * dy + SOFTENING * SOFTENING;
+    invR = 1 / Math.sqrt(r2);
+    a = p.gm / r2; // magnitude = GM / r²
+    ax += a * dx * invR;
     ay += a * dy * invR;
   }
   return { ax, ay };
@@ -346,12 +536,23 @@ function fire(turret) {
   // Spawn at the barrel tip, safely outside the planet surface.
   const sx = turret.x + Math.cos(dir) * BARREL_LEN;
   const sy = turret.y + Math.sin(dir) * BARREL_LEN;
+  // The shot inherits its launch platform's orbital velocity (a real frame
+  // effect, ~25 u/s) — the trajectory preview accounts for it identically.
+  const pv = planetVelAt(turret.planet, simTime);
+  const vx = Math.cos(dir) * speed + pv.vx;
+  const vy = Math.sin(dir) * speed + pv.vy;
   projectiles.push({
-    x: sx, y: sy,
-    vx: Math.cos(dir) * speed,
-    vy: Math.sin(dir) * speed,
+    x: sx, y: sy, vx, vy,
     owner: turret.id,
     life: PROJ_LIFETIME,
+    muzzle: Math.hypot(vx, vy), // reference speed for flavor/debug HUDs
+    // Graze bookkeeping — initialized from the ACTUAL spawn position, and
+    // entry-gated: only a shot that crosses INTO the ring during flight can
+    // earn the bounty on its way out. Both guards exist so a turret standing
+    // near perihelion can never mint free double points.
+    inGraze: (sx - sun.x) ** 2 + (sy - sun.y) ** 2 < GRAZE_R * GRAZE_R,
+    enteredGraze: false,
+    boosted: false,             // survived a sun graze → worth double
     trail: [],
   });
 }
@@ -382,11 +583,19 @@ function frame(now) {
 }
 
 function stepWorld(dt) {
-  // Timers (cooldowns, flashes, banners) advance in every phase.
+  // The solar system runs on rails in EVERY phase — the world keeps turning
+  // in the lobby, during countdowns and pauses. Only gameplay consequences
+  // (projectiles, scoring) are gated on 'playing' below.
+  simTime += dt;
+  updateBodies();
+
+  // Timers (cooldowns, flashes, banners, fx) advance in every phase.
   for (const t of turrets) {
     if (t.cooldown > 0) t.cooldown = Math.max(0, t.cooldown - dt);
     if (t.flash > 0) t.flash = Math.max(0, t.flash - dt);
   }
+  for (const f of fx) f.life -= dt;
+  fx = fx.filter((f) => f.life > 0);
   if (bannerTimer > 0) {
     bannerTimer -= dt;
     if (bannerTimer <= 0) hideBanner();
@@ -399,7 +608,7 @@ function stepWorld(dt) {
   }
   if (phase !== 'playing') return;
 
-  // Integrate every projectile under the summed gravity of both planets.
+  // Integrate every projectile under the sun + both (moving) planets.
   for (const p of projectiles) {
     const g = gravityAt(p.x, p.y);
     p.vx += g.ax * dt;
@@ -407,6 +616,17 @@ function stepWorld(dt) {
     p.x += p.vx * dt;
     p.y += p.vy * dt;
     p.life -= dt;
+
+    // Sun-graze bounty: dip inside the graze ring and come back out alive and
+    // the shot goes white-hot — a hit is worth DOUBLE. Entry-gated: the shot
+    // must have crossed INTO the ring during flight (not merely started near
+    // the sun) before an exit crossing can qualify.
+    const dxs = p.x - sun.x, dys = p.y - sun.y;
+    const insideGraze = dxs * dxs + dys * dys < GRAZE_R * GRAZE_R;
+    if (!p.inGraze && insideGraze) p.enteredGraze = true;
+    if (p.inGraze && !insideGraze && p.enteredGraze) p.boosted = true;
+    p.inGraze = insideGraze;
+
     p.trail.push({ x: p.x, y: p.y });
     if (p.trail.length > 40) p.trail.shift();
   }
@@ -416,12 +636,17 @@ function stepWorld(dt) {
   for (const p of projectiles) {
     const outcome = classifyProjectile(p);
     if (outcome === 'alive') { survivors.push(p); continue; }
+    if (outcome.reason === 'sun') {
+      // Vaporized — a bright render-only flash at the point of death.
+      fx.push({ x: p.x, y: p.y, r: 10, life: 0.5, maxLife: 0.5, type: 'vaporize' });
+      continue;
+    }
     if (outcome.hitTurret) {
       // Score EXACTLY one hit per step. onTurretHit clears the field and moves
       // the phase machine (possibly to gameover) — processing further
       // collisions after it could erase a win or double-score, and assigning
       // `projectiles = survivors` below would resurrect the cleared shots.
-      onTurretHit(outcome.hitTurret, p.owner);
+      onTurretHit(outcome.hitTurret, p);
       return;
     }
     // otherwise it hit a planet, flew off-world, or fizzled — just remove it.
@@ -436,12 +661,16 @@ function classifyProjectile(p) {
   if (p.x < -400 || p.x > WORLD_W + 400 || p.y < -400 || p.y > WORLD_H + 400) {
     return { reason: 'oob' };
   }
-  // Hit a planet surface?
-  for (const pl of planets) {
-    const dx = pl.x - p.x, dy = pl.y - p.y;
-    if (dx * dx + dy * dy <= (pl.r + PROJ_R) * (pl.r + PROJ_R)) return { reason: 'planet' };
+  // Swallowed by the sun?
+  {
+    const dx = sun.x - p.x, dy = sun.y - p.y;
+    if (dx * dx + dy * dy <= (sun.r + PROJ_R) * (sun.r + PROJ_R)) return { reason: 'sun' };
   }
-  // Hit a turret? (Including your own — a boomerang shot can backfire.)
+  // Hit a planet's (lumpy, rotating) terrain?
+  for (const pl of planets) {
+    if (hitsPlanet(pl, p.x, p.y, simTime, PROJ_R)) return { reason: 'planet' };
+  }
+  // Hit a turret? (Only the enemy's — see the owner check.)
   for (const t of turrets) {
     if (t.id === p.owner) continue; // your shot can't score on your own turret while leaving the muzzle...
     const dx = t.x - p.x, dy = t.y - p.y;
@@ -452,11 +681,12 @@ function classifyProjectile(p) {
   return 'alive';
 }
 
-function onTurretHit(targetTurret, ownerId) {
+function onTurretHit(targetTurret, proj) {
   if (phase !== 'playing') return; // never score outside live play (defense-in-depth)
-  const shooter = turrets[ownerId - 1];
+  const shooter = turrets[proj.owner - 1];
   if (!shooter) return;
-  shooter.score += 1;
+  const points = proj.boosted ? 2 : 1; // sun-grazed shots score double
+  shooter.score += points;
   targetTurret.flash = 0.8;
   projectiles = []; // clear the field for a clean restart of the volley
 
@@ -464,7 +694,8 @@ function onTurretHit(targetTurret, ownerId) {
     phase = 'gameover';
     showBanner(`PLAYER ${shooter.id} WINS`, shooter.color, 5, () => resetMatch());
   } else {
-    showBanner(`PLAYER ${shooter.id} SCORES`, shooter.color, 1.2);
+    if (proj.boosted) showBanner(`SLINGSHOT! PLAYER ${shooter.id} +2`, '#ffd166', 1.4);
+    else showBanner(`PLAYER ${shooter.id} SCORES`, shooter.color, 1.2);
     // brief pause then continue
     phase = 'countdown';
     countdown = 1.2;
@@ -474,6 +705,14 @@ function onTurretHit(targetTurret, ownerId) {
 function resetMatch() {
   for (const t of turrets) { t.score = 0; t.cooldown = 0; t.flash = 0; }
   projectiles = [];
+  // Don't restart into a dead room: if a player dropped during the WIN banner,
+  // fall back to the lobby — maybeStartMatch() restarts when both return.
+  if (!(playerReady(1) && playerReady(2))) {
+    phase = 'lobby';
+    lobbyEl.classList.remove('hidden');
+    updateLobby();
+    return;
+  }
   startCountdown();
 }
 
@@ -541,21 +780,38 @@ function render() {
   }
   ctx.globalAlpha = 1;
 
-  // Planets with glow + radial shading.
+  // Orbit rings — faint dashed ellipses so the clockwork is readable at a glance.
+  ctx.save();
+  ctx.strokeStyle = 'rgba(205,216,255,0.09)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 10]);
   for (const p of planets) {
-    ctx.save();
-    ctx.shadowColor = p.glow;
-    ctx.shadowBlur = 60;
-    const g = ctx.createRadialGradient(p.x - p.r * 0.3, p.y - p.r * 0.3, p.r * 0.1, p.x, p.y, p.r);
-    g.addColorStop(0, '#ffffff');
-    g.addColorStop(0.25, p.color);
-    g.addColorStop(1, p.glow);
-    ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
+    ctx.ellipse(sun.x, sun.y, p.Rx, p.Ry, 0, 0, Math.PI * 2);
+    ctx.stroke();
   }
+  ctx.restore();
+
+  drawSun();
+
+  // Ghost outlines: where each planet WILL be in 1.5s — pairs with the
+  // time-true trajectory preview so leading a moving world is one glance.
+  ctx.save();
+  ctx.setLineDash([5, 7]);
+  ctx.lineWidth = 2;
+  for (const p of planets) {
+    const c = planetPosAt(p, simTime + 1.5);
+    ctx.strokeStyle = p.glow;
+    ctx.globalAlpha = 0.22;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, p.baseR, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+
+  // Planets: cached lumpy silhouette, rotated — spin comes free at draw time.
+  for (const p of planets) drawPlanet(p);
 
   // Aim-trajectory previews (only while playing) — a ghost shot per player.
   if (phase === 'playing' || phase === 'countdown') {
@@ -568,6 +824,17 @@ function render() {
   // Projectiles with trails.
   for (const p of projectiles) drawProjectile(p);
 
+  // Render-only effects (sun vaporization flashes).
+  for (const f of fx) {
+    const k = f.life / f.maxLife; // 1 → 0
+    ctx.globalAlpha = k * 0.9;
+    ctx.fillStyle = '#fff2c4';
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, f.r + (1 - k) * 26, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
   // Countdown number.
   if (phase === 'countdown' && countdown > 0) {
     const n = Math.ceil(countdown);
@@ -579,6 +846,66 @@ function render() {
     ctx.fillText(String(n), WORLD_W / 2, WORLD_H / 2);
     ctx.globalAlpha = 1;
   }
+}
+
+function drawSun() {
+  const pulse = 1 + 0.05 * Math.sin(simTime * 2.1);
+  // Corona: layered soft glow out to ~2.2r.
+  ctx.save();
+  const cg = ctx.createRadialGradient(sun.x, sun.y, sun.r * 0.4, sun.x, sun.y, sun.r * 2.3 * pulse);
+  cg.addColorStop(0, 'rgba(255,214,102,0.85)');
+  cg.addColorStop(0.35, 'rgba(255,160,70,0.35)');
+  cg.addColorStop(1, 'rgba(255,120,40,0)');
+  ctx.fillStyle = cg;
+  ctx.beginPath();
+  ctx.arc(sun.x, sun.y, sun.r * 2.3 * pulse, 0, Math.PI * 2);
+  ctx.fill();
+
+  // The graze ring — the double-points skill check, taught by drawing it.
+  ctx.setLineDash([3, 9]);
+  ctx.strokeStyle = 'rgba(255,214,102,0.28)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(sun.x, sun.y, GRAZE_R, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Core.
+  const g = ctx.createRadialGradient(sun.x - sun.r * 0.25, sun.y - sun.r * 0.25, sun.r * 0.1, sun.x, sun.y, sun.r);
+  g.addColorStop(0, '#fffbe8');
+  g.addColorStop(0.5, '#ffcf5c');
+  g.addColorStop(1, '#ff8a3c');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(sun.x, sun.y, sun.r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPlanet(p) {
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(p.rot); // the whole local frame spins — silhouette AND features
+  ctx.shadowColor = p.glow;
+  ctx.shadowBlur = 50;
+  const g = ctx.createRadialGradient(-p.baseR * 0.3, -p.baseR * 0.3, p.baseR * 0.1, 0, 0, p.maxR);
+  g.addColorStop(0, '#ffffff');
+  g.addColorStop(0.25, p.color);
+  g.addColorStop(1, p.glow);
+  ctx.fillStyle = g;
+  ctx.fill(p.path);
+  ctx.shadowBlur = 0;
+  // Surface blotches, clipped to the silhouette — these make the spin visible.
+  ctx.clip(p.path);
+  ctx.globalAlpha = 0.22;
+  ctx.fillStyle = '#000';
+  for (const b of p.blotches) {
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
 }
 
 function drawTurret(t) {
@@ -621,53 +948,92 @@ function drawTurret(t) {
 }
 
 function drawProjectile(p) {
+  // Sun-grazed shots burn white-gold — everyone on the couch sees the stakes.
+  const tint = p.boosted ? '#ffd166' : (p.owner === 1 ? '#ff6b6b' : '#4dd0ff');
   // Trail.
   for (let i = 0; i < p.trail.length; i++) {
     const pt = p.trail[i];
     const a = i / p.trail.length;
-    ctx.globalAlpha = a * 0.5;
-    ctx.fillStyle = p.owner === 1 ? '#ff6b6b' : '#4dd0ff';
+    ctx.globalAlpha = a * (p.boosted ? 0.75 : 0.5);
+    ctx.fillStyle = tint;
     ctx.beginPath();
-    ctx.arc(pt.x, pt.y, PROJ_R * a, 0, Math.PI * 2);
+    ctx.arc(pt.x, pt.y, PROJ_R * a * (p.boosted ? 1.4 : 1), 0, Math.PI * 2);
     ctx.fill();
   }
   ctx.globalAlpha = 1;
   // Head.
   ctx.save();
-  ctx.shadowColor = p.owner === 1 ? '#ff6b6b' : '#4dd0ff';
-  ctx.shadowBlur = 18;
+  ctx.shadowColor = tint;
+  ctx.shadowBlur = p.boosted ? 30 : 18;
   ctx.fillStyle = '#fff';
   ctx.beginPath();
-  ctx.arc(p.x, p.y, PROJ_R, 0, Math.PI * 2);
+  ctx.arc(p.x, p.y, PROJ_R * (p.boosted ? 1.25 : 1), 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
 }
 
-/** Simulate a lightweight ghost shot to show where the current aim/power lands. */
+/**
+ * TIME-TRUE trajectory preview: the ghost shot is integrated against the
+ * system as it WILL be — gravity and collision both evaluate planet positions
+ * and rotations at (simTime + k·dt), which is exact because the bodies are on
+ * closed-form rails. Dots turn gold from the step the shot would earn the
+ * sun-graze double bounty, teaching the mechanic without a word of rules.
+ */
 function drawTrajectoryPreview(t) {
   const dir = t.aim;
   const speed = MIN_SPEED + t.power * (MAX_SPEED - MIN_SPEED);
+  const pv = planetVelAt(t.planet, simTime); // same inheritance as fire()
   let x = t.x + Math.cos(dir) * BARREL_LEN;
   let y = t.y + Math.sin(dir) * BARREL_LEN;
-  let vx = Math.cos(dir) * speed;
-  let vy = Math.sin(dir) * speed;
-  const dt = 1 / 60;
-  ctx.fillStyle = t.color;
-  for (let i = 0; i < 90; i++) {
-    const g = gravityAt(x, y);
-    vx += g.ax * dt; vy += g.ay * dt;
-    x += vx * dt; y += vy * dt;
-    // Stop the preview at the first obstacle.
+  let vx = Math.cos(dir) * speed + pv.vx;
+  let vy = Math.sin(dir) * speed + pv.vy;
+
+  // PARITY IS SACRED. This ghost must be the sim, not an approximation of it:
+  // identical integrator step (DT, not a coarser one — semi-implicit Euler's
+  // error is O(dt), and near-sun slingshots amplify any mismatch into a
+  // different deflection), identical collision pads (PROJ_R everywhere),
+  // identical graze bookkeeping (spawn-init + entry-gated), identical OOB
+  // margins, and it even ends on the enemy turret like a real hit would.
+  // 200 substeps of DT = the same 1.67s lookahead; draw every 6th.
+  let inGraze = (x - sun.x) ** 2 + (y - sun.y) ** 2 < GRAZE_R * GRAZE_R;
+  let enteredGraze = false, boosted = false;
+  const enemy = turrets[t.id === 1 ? 1 : 0];
+  const STEPS = 200;
+  for (let i = 0; i < STEPS; i++) {
+    const tf = simTime + (i + 1) * DT; // the future moment this substep lands on
+    const g = gravityAt(x, y, tf);
+    vx += g.ax * DT; vy += g.ay * DT;
+    x += vx * DT; y += vy * DT;
+
+    // Dies in the sun? (Same padded test as classifyProjectile.)
+    const dxs = x - sun.x, dys = y - sun.y;
+    const ds2 = dxs * dxs + dys * dys;
+    if (ds2 <= (sun.r + PROJ_R) * (sun.r + PROJ_R)) break;
+    // Same entry-gated graze bookkeeping as the live sim.
+    const ig = ds2 < GRAZE_R * GRAZE_R;
+    if (!inGraze && ig) enteredGraze = true;
+    if (inGraze && !ig && enteredGraze) boosted = true;
+    inGraze = ig;
+
+    // Ends on the enemy turret (at ITS future position), like the sim.
+    const ec = planetPosAt(enemy.planet, tf);
+    const ea = enemy.anchorAngle + enemy.planet.spin * tf;
+    const ex = ec.x + Math.cos(ea) * enemy.anchorR - x;
+    const ey = ec.y + Math.sin(ea) * enemy.anchorR - y;
+    if (ex * ex + ey * ey <= (TURRET_HIT_R + PROJ_R) * (TURRET_HIT_R + PROJ_R)) break;
+
+    // Stop at terrain — planets where they'll be at tf, sim's pad.
     let blocked = false;
     for (const pl of planets) {
-      const dx = pl.x - x, dy = pl.y - y;
-      if (dx * dx + dy * dy <= pl.r * pl.r) { blocked = true; break; }
+      if (hitsPlanet(pl, x, y, tf, PROJ_R)) { blocked = true; break; }
     }
-    if (blocked || x < -200 || x > WORLD_W + 200 || y < -200 || y > WORLD_H + 200) break;
-    if (i % 3 === 0) {
-      ctx.globalAlpha = 0.5 * (1 - i / 90);
+    if (blocked || x < -400 || x > WORLD_W + 400 || y < -400 || y > WORLD_H + 400) break;
+
+    if (i % 6 === 0) {
+      ctx.fillStyle = boosted ? '#ffd166' : t.color;
+      ctx.globalAlpha = (boosted ? 0.8 : 0.5) * (1 - i / STEPS);
       ctx.beginPath();
-      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.arc(x, y, boosted ? 3.6 : 3, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -748,6 +1114,9 @@ function onPlayerDropped(playerId) {
   updateLobby();
   if (phase === 'playing' || phase === 'countdown') {
     phase = 'paused';
+    // Clear live shots: the solar system keeps orbiting while paused, so a
+    // frozen projectile could be swept into a turret and score on resume.
+    projectiles = [];
     showBanner(`PLAYER ${playerId} DISCONNECTED`, '#ffd166', 9999);
   }
 }
@@ -781,6 +1150,7 @@ function syncScores() {
 // =============================  BOOT  =====================================
 
 resize();
+updateBodies(); // position the solar system before the first render tick
 connectSignaling();
 requestAnimationFrame(frame);
 requestAnimationFrame(syncScores);
