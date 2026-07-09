@@ -263,6 +263,19 @@ export class RoomDurableObject {
     } catch {
       return; // ignore malformed frames
     }
+
+    // RELAY FALLBACK: when a phone's WebRTC handshake cannot complete (cellular,
+    // AP isolation, symmetric NAT — anything STUN alone can't punch), the
+    // controller falls back to sending inputs over this WebSocket and we forward
+    // them to the screen. P2P remains the primary path — this branch only ever
+    // carries traffic for players whose direct connection failed.
+    if (msg.type === 'input' && meta.role === 'controller' && meta.slot) {
+      for (const s of this.state.getWebSockets('screen')) {
+        s.send(JSON.stringify({ type: 'input', from: meta.slot, data: msg.data }));
+      }
+      return;
+    }
+
     if (msg.type !== 'signal') return;
 
     if (meta.role === 'controller') {

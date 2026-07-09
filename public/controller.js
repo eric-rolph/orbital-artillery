@@ -28,6 +28,24 @@ let channel = null;
 let playerId = null;
 let roomCode = '';
 let pendingIce = []; // ICE candidates that arrive before our remote description is set
+// Re-entrancy latch for connect(). MUST be declared before the boot IIFE runs:
+// the QR deep-link path calls connect() during init, and a `let` further down
+// the file would still be in its temporal dead zone → ReferenceError that also
+// kills the rest of init() (including the CONNECT button's click handler).
+let connecting = false;
+
+// ------- Relay fallback state -------
+// P2P is the primary transport, but STUN alone cannot punch every network
+// (phone on cellular, Wi-Fi AP/client isolation, symmetric NAT). If the data
+// channel hasn't opened shortly after joining — or the connection outright
+// fails — we fall back to sending inputs over the signaling WebSocket, which
+// the Durable Object forwards to the screen. Latency is a hop higher but the
+// game always works. `?relay=1` forces this path (testing / stubborn networks).
+const FORCE_RELAY = new URL(location.href).searchParams.get('relay') === '1';
+const RELAY_FALLBACK_MS = 4000;
+let relayMode = false;
+let relayTimer = null;
+let screenOnline = true; // flips on 'screen-disconnected' so relay doesn't talk to nobody
 
 // ------- Input state (streamed to the Screen) -------
 let aim = 0;          // radians
@@ -55,12 +73,8 @@ const fireBtn = document.getElementById('fire');
 // ==========================  BOOT  ==========================
 // If the deep link carried ?code=ABCD (e.g. from the QR code), auto-connect.
 (function init() {
-  const url = new URL(location.href);
-  const code = (url.searchParams.get('code') || '').toUpperCase();
-  if (/^[A-Z2-9]{4}$/.test(code)) {
-    codeInput.value = code;
-    connect(code);
-  }
+  // Wire the manual controls FIRST: if anything below (e.g. the auto-connect)
+  // ever throws, the CONNECT button must still work as the fallback.
   codeInput.addEventListener('input', () => {
     codeInput.value = codeInput.value.toUpperCase().replace(/[^A-Z2-9]/g, '').slice(0, 4);
   });
@@ -70,11 +84,17 @@ const fireBtn = document.getElementById('fire');
     else gateMsg.textContent = 'Enter a valid 4-character code.';
   });
   codeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') connectBtn.click(); });
+
+  // QR deep link: ?code=ABCD pre-fills and auto-connects.
+  const url = new URL(location.href);
+  const code = (url.searchParams.get('code') || '').toUpperCase();
+  if (/^[A-Z2-9]{4}$/.test(code)) {
+    codeInput.value = code;
+    connect(code);
+  }
 })();
 
 // ==========================  SIGNALING  ==========================
-let connecting = false; // re-entrancy latch for connect()
-
 function connect(code) {
   // Guard against stacking: a second CONNECT tap (or ?code auto-connect racing
   // a manual tap) must not open a duplicate WebSocket + RTCPeerConnection on
@@ -108,6 +128,7 @@ function connect(code) {
       case 'screen-disconnected':
         // Informational — STAY in the room. If the host refreshes the screen,
         // the DO replays our presence and a fresh offer revives us in place.
+        screenOnline = false;
         showGateError('The screen went offline — waiting for it to come back…');
         setDisconnected();
         break;
@@ -129,6 +150,9 @@ function connect(code) {
 function failGate(text) {
   const oldWs = ws, oldPc = pc;
   ws = null; pc = null; channel = null; playerId = null; pendingIce = [];
+  clearTimeout(relayTimer);
+  relayMode = false;
+  screenOnline = true;
   connecting = false;
   connectBtn.disabled = false;
   try { oldWs && oldWs.close(); } catch {}
@@ -149,7 +173,35 @@ function onJoined() {
   roomLabel.textContent = `ROOM ${roomCode}`;
   badge.style.background = color;
 
-  createPeer();
+  // Progress feedback: the join succeeded; the P2P handshake is next. If it
+  // stalls, the relay fallback below activates the controls anyway.
+  gateMsg.innerHTML = '<div class="spinner"></div>';
+  gateMsg.append(` Joined as Player ${playerId} — linking to the screen…`);
+
+  if (FORCE_RELAY) {
+    engageRelay();
+  } else {
+    createPeer();
+    scheduleRelayFallback();
+  }
+}
+
+/** Arm the P2P-didn't-make-it timer. Cleared the moment the channel opens. */
+function scheduleRelayFallback() {
+  clearTimeout(relayTimer);
+  relayTimer = setTimeout(() => {
+    if (channel && channel.readyState === 'open') return; // P2P made it after all
+    engageRelay();
+  }, RELAY_FALLBACK_MS);
+}
+
+/** Switch input transport to the DO's WebSocket relay and unlock the controls. */
+function engageRelay() {
+  if (relayMode) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !playerId || !screenOnline) return;
+  relayMode = true;
+  roomLabel.textContent = `ROOM ${roomCode} · RELAY`;
+  activateControls();
 }
 
 /**
@@ -185,7 +237,10 @@ function createPeer() {
     // controls (nothing re-fires the channel's 'open' event afterwards). Only
     // 'failed'/'closed' are dead; on recovery, restore the UI.
     if (['failed', 'closed'].includes(myPc.connectionState)) {
-      setDisconnected();
+      // Dead P2P — degrade to the relay right away instead of waiting out
+      // the fallback timer (or bricking if it already fired and failed).
+      if (ws && ws.readyState === WebSocket.OPEN && playerId && screenOnline) engageRelay();
+      else setDisconnected();
     } else if (myPc.connectionState === 'connected' && channel && channel.readyState === 'open') {
       onChannelOpen();
     }
@@ -196,6 +251,10 @@ function createPeer() {
 async function handleSignal(data) {
   // Shape-check first — the DO relays this payload opaquely.
   if (!data || typeof data !== 'object') return;
+  // Any signal proves a screen is alive again (e.g. after a refresh).
+  screenOnline = true;
+  // Forced relay mode never builds a peer connection at all.
+  if (FORCE_RELAY) return;
 
   if (data.sdp) {
     // A fresh OFFER while we already hold a completed session means the Screen
@@ -239,6 +298,16 @@ function wsSignal(data) {
 // Note: also invoked event-less from the ICE-recovery branch in createPeer().
 function onChannelOpen(e) {
   if (e && channel && e.target !== channel) return; // stale channel of a replaced pc
+  // P2P is live — it always wins over the relay (lower latency, zero server).
+  clearTimeout(relayTimer);
+  relayMode = false;
+  roomLabel.textContent = `ROOM ${roomCode}`;
+  screenOnline = true;
+  activateControls();
+}
+
+/** Unlock the gamepad UI — shared by the P2P and relay activation paths. */
+function activateControls() {
   gate.classList.add('hidden');
   document.body.classList.remove('disconnected');
   fireBtn.disabled = false;
@@ -252,7 +321,9 @@ function onChannelClose(e) {
   // Only react if the CURRENT channel closed (or none replaced it yet) — the
   // old channel of a rebuilt connection closing must not brick the new one.
   if (channel && e && e.target !== channel) return;
-  setDisconnected();
+  // P2P died mid-game — degrade to the relay rather than bricking, if we can.
+  if (ws && ws.readyState === WebSocket.OPEN && playerId && screenOnline) engageRelay();
+  else setDisconnected();
 }
 
 function setDisconnected() {
@@ -261,10 +332,19 @@ function setDisconnected() {
   whoLabel.textContent = 'DISCONNECTED';
 }
 
-/** Reliable send helper; drops silently if the channel isn't open yet. */
+/** True if we currently have ANY way to reach the screen. */
+function transportUp() {
+  if (channel && channel.readyState === 'open') return true;
+  return relayMode && ws && ws.readyState === WebSocket.OPEN;
+}
+
+/** Send one input packet over the best live transport (P2P first, then relay). */
 function send(obj) {
   if (channel && channel.readyState === 'open') {
-    try { channel.send(JSON.stringify(obj)); } catch {}
+    try { channel.send(JSON.stringify(obj)); return; } catch {}
+  }
+  if (relayMode && ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ type: 'input', data: obj })); } catch {}
   }
 }
 
@@ -357,7 +437,7 @@ setPowerFromEvent(powerTrack.getBoundingClientRect().left + powerTrack.getBoundi
 // ==========================  INPUT: FIRE  ==========================
 function doFire(e) {
   if (e) e.preventDefault();
-  if (!channel || channel.readyState !== 'open') return;
+  if (!transportUp()) return;
   send({ t: 'fire' });
   if (navigator.vibrate) navigator.vibrate(45); // punchy haptic
 }
@@ -366,10 +446,11 @@ fireBtn.addEventListener('mousedown', doFire);
 
 // ==========================  SEND LOOP  ==========================
 // Coalesce aim/power to at most one message per frame — smooth for the Screen,
-// gentle on the channel. Fire is sent immediately (above), never coalesced.
+// gentle on the transport (P2P channel or WS relay alike). Fire is sent
+// immediately (above), never coalesced.
 function pump() {
   requestAnimationFrame(pump);
-  if (!channel || channel.readyState !== 'open') return;
+  if (!transportUp()) return;
   if (aimDirty) { send({ t: 'aim', a: aim }); aimDirty = false; }
   if (powerDirty) { send({ t: 'power', p: power }); powerDirty = false; }
 }

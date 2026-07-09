@@ -82,3 +82,13 @@ Manual deploy: `npm run deploy`.
   retransmits are negligible and a dropped FIRE would be unacceptable.
 - **No TURN**: only STUN is configured. Relaying would drag a server back into the
   data path; on the same Wi-Fi, host candidates connect directly.
+- **Relay fallback**: STUN alone can't punch every network (phone on cellular,
+  Wi-Fi AP/client isolation, symmetric NAT). If a controller's data channel
+  hasn't opened ~4 s after joining — or the connection fails outright — it
+  transparently falls back to sending inputs over its signaling WebSocket and
+  the Durable Object forwards them to the screen (`RELAY` shows next to the
+  room code). P2P remains the primary path and wins back automatically if it
+  ever completes. Force it with `controller.html?code=XXXX&relay=1`.
+- **E2E harness**: open `/harness.html` (or `/harness.html?relay=1`) to run the
+  real screen + controller side by side in one tab and drive a scripted
+  join → aim → power → fire pass across the full stack.

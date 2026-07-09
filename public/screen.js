@@ -52,6 +52,10 @@ const RTC_CONFIG = {
 
 /** @type {Map<number, {pc: RTCPeerConnection, dc: RTCDataChannel|null, ready: boolean, pending: RTCIceCandidateInit[]}>} */
 const peers = new Map();
+// Players whose P2P handshake failed and who deliver inputs via the DO's
+// WebSocket relay instead (see the 'input' case below). A player is "ready"
+// if EITHER transport is live.
+const relayPlayers = new Set();
 let signalSocket = null;
 let roomCode = '';
 
@@ -77,11 +81,26 @@ function connectSignaling() {
         startPeer(msg.playerId);
         break;
       case 'player-left':
+        relayPlayers.delete(msg.playerId);
         teardownPeer(msg.playerId);
+        onPlayerDropped(msg.playerId);
         break;
       case 'signal':
         // An SDP answer or ICE candidate from a specific phone.
         handleSignal(msg.from, msg.data);
+        break;
+      case 'input':
+        // RELAY FALLBACK: this player's WebRTC handshake failed, so their
+        // inputs arrive through the Durable Object over WebSocket. The first
+        // frame doubles as their "ready" announcement.
+        if (!msg.from || !msg.data || typeof msg.data !== 'object') break;
+        if (!relayPlayers.has(msg.from)) {
+          relayPlayers.add(msg.from);
+          markPlayerConnection(msg.from, true);
+          updateLobby();
+          maybeStartMatch();
+        }
+        handleControllerInput(msg.from, msg.data);
         break;
     }
   });
@@ -164,7 +183,11 @@ function wireDataChannel(playerId, dc) {
     onPlayerDropped(playerId);
   });
   // *** The gameplay hot path. Runs entirely over P2P WebRTC — no server. ***
-  dc.addEventListener('message', (ev) => handleControllerInput(playerId, ev.data));
+  dc.addEventListener('message', (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch { return; }
+    handleControllerInput(playerId, m);
+  });
 }
 
 /** Apply an inbound SDP answer or ICE candidate to the right peer connection. */
@@ -286,15 +309,15 @@ function gravityAt(x, y) {
 // =============================  INPUT  =====================================
 
 /**
- * Handle one controller packet arriving over the P2P data channel.
+ * Handle one controller packet — already parsed — from EITHER transport
+ * (P2P data channel, or the DO relay for players whose handshake failed).
  * Packet shapes (kept tiny for latency):
  *   { t:'aim',   a:<radians> }
  *   { t:'power', p:<0..1> }
  *   { t:'fire' }
  */
-function handleControllerInput(playerId, raw) {
-  let msg;
-  try { msg = JSON.parse(raw); } catch { return; }
+function handleControllerInput(playerId, msg) {
+  if (!msg || typeof msg !== 'object') return;
   const turret = turrets[playerId - 1];
   if (!turret) return;
 
@@ -690,25 +713,28 @@ function markPlayerConnection(playerId, up) {
   if (el) el.style.color = up ? (playerId === 1 ? '#ff6b6b' : '#4dd0ff') : '#55607a';
 }
 
+/** A player is ready when EITHER transport is live: P2P channel or DO relay. */
+function playerReady(id) {
+  return !!peers.get(id)?.ready || relayPlayers.has(id);
+}
+
 /** Reflect join/ready state in the lobby player slots. */
 function updateLobby() {
   for (let id = 1; id <= 2; id++) {
     const slot = document.getElementById('slot-' + id);
     if (!slot) continue;
-    const peer = peers.get(id);
     let state = 'empty', status = 'waiting…';
-    if (peer && peer.ready) { state = 'ready'; status = 'ready ✔'; }
-    else if (peer) { state = 'joined'; status = 'connecting…'; }
+    if (playerReady(id)) { state = 'ready'; status = relayPlayers.has(id) ? 'ready ✔ (relay)' : 'ready ✔'; }
+    else if (peers.get(id)) { state = 'joined'; status = 'connecting…'; }
     slot.dataset.state = state;
     slot.querySelector('.status').textContent = status;
   }
 }
 
-/** Begin the match once BOTH players' data channels are live. */
+/** Begin the match once BOTH players have a live input transport. */
 function maybeStartMatch() {
   if (phase !== 'lobby' && phase !== 'paused') return;
-  const p1 = peers.get(1), p2 = peers.get(2);
-  if (p1 && p1.ready && p2 && p2.ready) {
+  if (playerReady(1) && playerReady(2)) {
     lobbyEl.classList.add('hidden');
     hudEl.classList.add('show');
     hudCodeEl.classList.add('show');

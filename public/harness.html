@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Orbital Artillery — E2E Harness</title>
+  <!-- Dev/test harness: runs the REAL screen and controller pages side by side in
+       same-origin iframes so the full stack (signaling DO + WebRTC loopback +
+       game engine) can be exercised and asserted from one browser tab.
+       Append ?relay=1 to force the controller into relay mode. -->
+  <style>
+    body { margin: 0; font-family: monospace; background: #111; color: #ddd; }
+    #status { padding: 8px 12px; white-space: pre-wrap; border-bottom: 1px solid #333; min-height: 4em; }
+    .row { display: flex; height: calc(100vh - 6em); }
+    iframe { flex: 1; border: 1px solid #333; height: 100%; }
+    #ctl { max-width: 420px; }
+  </style>
+</head>
+<body>
+  <div id="status">booting…</div>
+  <div class="row">
+    <iframe id="scr" src="/screen.html"></iframe>
+    <iframe id="ctl" src="about:blank"></iframe>
+  </div>
+  <script>
+    const statusEl = document.getElementById('status');
+    const lines = [];
+    function log(s) { lines.push(s); statusEl.textContent = lines.join('\n'); }
+    // Expose results for automated polling from the outer test driver.
+    window.HARNESS = { done: false, ok: false, results: {} };
+
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    async function until(fn, timeout, label) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeout) {
+        try { const v = fn(); if (v) return v; } catch {}
+        await wait(120);
+      }
+      throw new Error('timeout: ' + label);
+    }
+
+    (async () => {
+      const R = window.HARNESS.results;
+      const scr = document.getElementById('scr');
+      const ctl = document.getElementById('ctl');
+      const forceRelay = new URL(location.href).searchParams.get('relay') === '1';
+
+      // 1. Wait for the screen to obtain a room code.
+      const code = await until(() => {
+        const t = scr.contentDocument?.getElementById('room-code')?.textContent;
+        return /^[A-Z2-9]{4}$/.test(t) ? t : null;
+      }, 10000, 'room code');
+      R.code = code;
+      log('room code: ' + code);
+
+      // 2. Boot the controller with the deep link (exactly what the QR encodes).
+      ctl.src = '/controller.html?code=' + code + (forceRelay ? '&relay=1' : '');
+
+      // 3. Wait for the controller's gate to hide = controls active (P2P or relay).
+      await until(() => ctl.contentDocument?.getElementById('gate')?.classList.contains('hidden'), 15000, 'controller active');
+      R.controllerActive = true;
+      R.roomLabel = ctl.contentDocument.getElementById('room-label').textContent;
+      log('controller active. label: ' + R.roomLabel);
+
+      // 4. Screen must consider Player 1 ready (P2P dc open OR relay engaged).
+      await until(() => scr.contentDocument?.getElementById('slot-1')?.dataset.state === 'ready', 8000, 'screen slot ready');
+      R.screenSawPlayer = true;
+      log('screen shows player 1 ready');
+
+      // 5. Drive gameplay: set aim/power, wait out any countdown, FIRE, and
+      //    assert a projectile actually spawns in the screen's engine.
+      // NOTE: screen.js top-level `const/let` (turrets, projectiles, phase) are
+      // NOT window properties — reach them via the iframe's global eval.
+      const cw = ctl.contentWindow, sw = scr.contentWindow;
+      cw.setAim(-0.9);
+      // setPowerFromEvent takes a clientX; aim for ~80% of the track.
+      const tr = ctl.contentDocument.getElementById('power-track').getBoundingClientRect();
+      cw.setPowerFromEvent(tr.left + tr.width * 0.8);
+      await wait(400); // let the coalesced input pump flush
+      R.screenAim = sw.eval('turrets[0].aim');
+      R.screenPower = sw.eval('turrets[0].power');
+      log('screen turret state: aim=' + R.screenAim.toFixed(2) + ' power=' + R.screenPower.toFixed(2));
+
+      // Single-player harness: only P1 joined, so the match never starts and
+      // phase stays 'lobby'. Force it to 'playing' to test the fire path.
+      sw.eval('phase = "playing"');
+      cw.doFire();
+      await until(() => sw.eval('projectiles.length') > 0, 3000, 'projectile spawned');
+      R.projectileSpawned = true;
+      log('projectile spawned on screen ✔');
+
+      window.HARNESS.ok =
+        R.controllerActive && R.screenSawPlayer && R.projectileSpawned &&
+        Math.abs(R.screenAim - (-0.9)) < 0.01 && Math.abs(R.screenPower - 0.8) < 0.03 &&
+        (forceRelay ? R.roomLabel.includes('RELAY') : !R.roomLabel.includes('RELAY'));
+      log(window.HARNESS.ok ? 'ALL CHECKS PASSED' : 'CHECKS FAILED');
+    })().catch((e) => {
+      log('FAILED: ' + e.message);
+    }).finally(() => { window.HARNESS.done = true; });
+  </script>
+</body>
+</html>
