@@ -1,7 +1,24 @@
 # 🛰️ Orbital Artillery — Kepler's Duel
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-34d399)](LICENSE)
+[![WebRTC P2P](https://img.shields.io/badge/WebRTC-Peer--to--Peer%20Gamepad-38bdf8)](public/screen.js)
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20Durable%20Objects-f97316)](worker.js)
+
 A **local-multiplayer, browser-based 2D artillery game**. One shared display (a TV
 or monitor) is the **Screen**; each player's **smartphone** is the gamepad.
+
+<p align="center">
+  <img src="docs/preview.png" alt="Orbital Artillery — WebRTC couch-multiplayer lobby" width="760" />
+</p>
+
+```mermaid
+flowchart LR
+    P1["Phone 1<br/>Touch Gamepad"] <-->|"WebRTC DataChannel (0 server bandwidth)"| SCR["Shared TV / Monitor<br/>2D Orbital Physics Screen"]
+    P2["Phone 2<br/>Touch Gamepad"] <-->|"WebRTC DataChannel (0 server bandwidth)"| SCR
+    P1 -.->|"Room code SDP handshake"| CF["Cloudflare Worker +<br/>SQLite Durable Object"]
+    P2 -.->|"Room code SDP handshake"| CF
+    SCR -.->|"Room code SDP handshake"| CF
+```
 
 The battlefield is a **living clockwork solar system**: two craggy, slowly-spinning
 planets ride elliptical orbits around a molten sun, carrying the players' turrets
